@@ -82,21 +82,25 @@ def calc_lambda(rho, m, objective, xtol=1e-3, max_iter=100):
     # exponential search
     lbd_l, lbd_r = exponential_lambda_search(rho, m, objective)
     # binary search
+    convergence = []
     for _ in range(max_iter):  # log2((max-min)/xtol) steps needed (70 is enough for f32 and 1e-3)
         mid = (lbd_l + lbd_r) / 2  # middle
         _, v = objective(rho, mid.view(-1, 1, 1, 1))  # current payload
         too_high = v > m  # splitting rule
         lbd_l = torch.where(too_high, mid, lbd_l)  # lower half
         lbd_r = torch.where(~too_high, mid, lbd_r)  # upper half
+        f = v - m  
+        convergence.append(f.abs().max().item())  
         if (lbd_r - lbd_l).max() < xtol:  # early exit
             break
-    #
+   
     lbd = (lbd_l + lbd_r) / 2  # midpoint is the final lambda
     _, h_hat = objective(rho, lbd.view(-1, 1, 1, 1))  # final entropy
-    return lbd, h_hat
+    return lbd, h_hat, convergence
 
 
 CUSTOM_LAMBDA = calc_lambda
+CONVERGENCE = []
 
 @torch.compile
 def average_payload(
@@ -108,7 +112,7 @@ def average_payload(
     rho is a cost tensor of shape (B, C, H, W)
     lbda is a float parameter
     """
-    p = F.softmax(-lbda * rho, dim=1)  # get selection channel
+    p = F.softmax(-lbda * rho, dim=1) 
     h_hat = entropy(p)
     return p, h_hat
 
@@ -124,14 +128,15 @@ class find_lambda(torch.autograd.Function):
         B = rho.size(0)
         lbdas = []
         t0 = time()
-        lbdas, h_hat = CUSTOM_LAMBDA(
+        lbdas, h_hat,convergence = CUSTOM_LAMBDA(
             rho=rho,
             m=m,
             objective=objective,
         )
         t1 = time()
-        global TIME_SPENT
+        global TIME_SPENT, CONVERGENCE
         TIME_SPENT.append(t1 - t0)
+        CONVERGENCE = convergence
         lbdas = lbdas.view(B, 1, 1, 1)
         with torch.enable_grad():
             r = rho.detach().requires_grad_(True)
@@ -266,10 +271,13 @@ def simulate(
     return delta
 
 
-def simulateExperiment(customLambda: Optional[Callable] = None):
+
+def simulateExperiment(customLambda: Optional[Callable] = None,alpha: float = 0.4,q: int = 3):
     global CUSTOM_LAMBDA
     global TIME_SPENT
+    global CONVERGENCE
     TIME_SPENT = []
+    CONVERGENCE = []
 
     if customLambda is not None:
         CUSTOM_LAMBDA = customLambda
@@ -282,7 +290,8 @@ def simulateExperiment(customLambda: Optional[Callable] = None):
     # calculate cost
     x = np.array(Image.open('seal6.png'))
     rho = cl.hill._costmap.compute_cost(x)
-    rho = np.stack([np.zeros_like(rho), rho, rho], axis=0)  # symmetric costs
+    # ------ Here i extended it to q-ary n
+    rho = np.stack([np.zeros_like(rho)] + [rho] * (q-1), axis=0) # symmetric costs 
 
     # convert to torch
     device = torch.device('cpu')
@@ -293,19 +302,18 @@ def simulateExperiment(customLambda: Optional[Callable] = None):
     # stego parameters
     B, C, H, W = x0.size()
     N = C * H * W  # number of elements
-    alpha = .4  # bpp
 
     # simulated embedding
     lbda = find_lambda.apply(rho, alpha * N, N)
     p, _ = average_payload(rho, lbda)
-    delta = simulate(p=p, one_hot=False, simulator_method='gumbel-softmax', stego_seed=12345)
+    delta = simulate(p=p, one_hot=True, simulator_method='gumbel-softmax', stego_seed=12345)
 
     # stego parameters
     h = entropy(p)
     alpha_hat = h / N
     beta = torch.sum(p[:, 1:], dim=(1, 2, 3)) / N
     beta_hat = torch.mean(torch.abs(delta), dim=(1, 2, 3))
-    return alpha_hat,beta,beta_hat,TIME_SPENT
+    return alpha_hat,beta,beta_hat,TIME_SPENT,CONVERGENCE
 
 if __name__ == '__main__':
     simulateExperiment()
